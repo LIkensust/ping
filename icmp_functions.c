@@ -1,10 +1,30 @@
 #include <stdio.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <netinet/ip_icmp.h>
+#include <unistd.h>
+#incldue <signal.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <sys/time.h>
+#include <string.h>
+#include <netdb.h>
+#include <pthread.h>
+
+#define K 1024
+#define BUFFERSIZE 72
+
 static unsigned short icmp_cksum(unsigned char *data,int len);//计算检验和
 static void icmp_pack(struct icmp *icmph,int seq,struct timeval *tv,int length);//icmp报头填写
 static int icmp_unpack(char *buf,int len);//icmp报头的剥离
 static struct timeval icmp_tvsub(struct timeval end,struct timeval begin);//计算时间差
 static void *icmp_send(void *argv)//发送报文
 static void *icmp_recv(void *argv)//接受报文
+static pingm_packet *icmp_findpacket(int seq);//在发送包状态数组中找一个位置
+static void icmp_statistics(void);//打印最终的统计结果
+static void icmp_sigint(int signo);//信号处理函数
+static void icmp_usage();
 
 typedef struct pingm_packet
 {
@@ -14,7 +34,7 @@ typedef struct pingm_packet
 	int flag;
 }pingm_packet;
 
-static pingm_packet pingpacket[128];
+
 
 static void icmp_sigint(int signo)
 {
@@ -48,9 +68,162 @@ struct icmp
 };
 
 
+static pingm_packet pingpacket[128];
+static unsigned char send_buff[BUFFERSIZE];
+static unsigned char recv_buff[2*K];
+static struct sockaddr_in dest;
+static int rawsock = 0;
+static pid_t pid = 0;
+static int alive = 0;
+static short packet_send = 0;
+static short packet_recv = 0;
+static char dest_str[80];
+static struct timeval tv_begin,tv_end,tv_internel;
+
+int main(int argc,char *argv[])
+{
+	struct hostent * host =NULL;
+	struct protected *protocol = NULL;
+	char protoname[] = "icmp";
+	unsigned long inaddr = 1;
+	int size = 128*K;
+	
+	if(argc < 2)
+	{
+		icmp_usage();
+		return -1;
+	}
+	
+	protocol = getprotobyname(protoname);
+	if(protocol == NULL)
+	{
+		perror("getprotobyname()");
+		return -1;
+	}
+	
+	memcpy(dest_str,argv[1],strlen(argv[1]+1));
+	memset(pingpacket,0,sizeof(pingm_packet)*128);
+	
+	rawsock = socket(AF_INET,SOCK_RAM,protocol->p_proto);
+	
+	if(rawsock < 0)
+	{
+		perror("socker");
+		return -1;
+	}
+	
+	pid = getpid();
+	
+	setsockopt(rawsock,SOL_SOCKET,SO_RCVBUF,&size,sizeof(size));//增大接受缓存区 防止接受的包被覆盖
+	bzero(&dest,sizeof(dest));
+	
+	dest.sin_family = AF_INET;
+	
+	inaddr = inet_addr(argv[1]);
+	if(inaddr == INADDR_NONE)//需要dns
+	{
+		host = gethostbyname(argv[1]);
+		if(host == NULL)
+		{
+			perror("gethostbyname");
+			return -1;
+		}
+		memcpy((char *)&dest.sin_addr,host->h_addr,host->h_length);
+	}
+	else
+	{
+		memcpy((char *)&dest.sin_addr,&inaddr,sizeof(inaddr));
+	}
+	
+	inaddr = dest.sin_addr.s_addr;
+	
+	printf("PING %s (%d.%d.%d.%d) 56(84) bytes of data.\n",
+			dest_str,
+			(inaddr&0x000000FF)>>0,
+			(inaddr&0x0000FF00)>>8,
+			(inaddr&0x00FF0000)>>16,
+			(inaddr&0xFF000000)>>24);
+			
+	signal(SIGINT,icmp_sigint);
+	
+	
+	alive = 1;
+	pthread_t send_id,recv_id;
+	int err = 0;
+	err = pthread_creade(&send_id,NULL,icmp_send,NULL);
+	if(err < 0)
+	{
+		return -1;
+	}
+	err = pthread_create(&recv_id,NULL,icmp_recv,NULL);
+	if(err < 0)
+	{
+		return -1;
+	}
+	
+	pthread_join(send_id,NULL);
+	pthread_join(recv_id,NULL);
+	
+	close(rawsock);
+	icmp_statistics();
+	return 0;
+}
 
 
 
+
+
+
+static void icmp_usage()
+{
+	fprintf(stderr,
+			"中文输出的ping工具 1.0"
+			"cping [ip]"
+			"ctrl+c 退出");
+	return;
+}
+
+static pingm_packet *icmp_findpacket(int seq)
+{
+	int i = 0;
+	pingm_packet *found = NULL;
+	//查找包的位置
+	if(seq == -1)//-1表示查找的是空包的位置
+	{
+		for(i=0;i<128;i++)
+		{
+			if(pingpacket[i].flag == -1)
+			{
+				found = &pingpacket[i];
+				break;
+			}
+		}
+	}
+	else if(seq >= 0) //查找对应的seq包
+	{
+		for(i=0;i<128;i++)
+		{
+			if(pingpacket[i].flag == seq)
+			{
+				found = &pingpacket[i];
+				break;
+			}
+		}
+	}
+	return found;
+}
+
+static void icmp_statistics(void)
+{
+	long time = (tv_internel.tv_sec * 1000)+(tv_internel.tv_usec/1000);
+	printf("--- %s ping statistics ---\n",dest_str);
+	printf("%d packets transmitted, %d received, %d%c packet loss,time %d ms\n",
+			packet_send,
+			packet_recv,
+			(packet_send-packet_recv)*100/packet_send,
+			'%',
+			time);
+}
 
 static unsigned short icmp_cksum(unsigned char *data,int len)
 {
@@ -183,7 +356,7 @@ static void *icmp_send(void *argv)//发送报文
 		
 		icmp_pack((struct icmp*)send_buff,packet_send,&tv,64);
 		
-		size = sendto(rawsock,send_buf,64,0,(struct sockaddr*)&dest,sizeof(struct sockaddr));
+		size = sendto(rawsock,send_buff,64,0,(struct sockaddr*)&dest,sizeof(struct sockaddr));
 		
 		if(size < 0)
 		{
@@ -223,7 +396,7 @@ static void *icmp_recv(void *argv)
 				int fromlen = 0;
 				struct sockaddr from;
 				//接受数据
-				int size = recv(rawsock,recv_buff,sizeof(rev_buff),0);
+				int size = recv(rawsock,recv_buff,sizeof(recv_buff),0);
 				if(errno == EINTR)
 				{
 					perror("recvfrom error");
