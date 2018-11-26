@@ -4,7 +4,7 @@
 #include <netinet/ip.h>
 #include <netinet/ip_icmp.h>
 #include <unistd.h>
-#incldue <signal.h>
+#include <signal.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <sys/time.h>
